@@ -44,6 +44,7 @@
 
 #import "BulletinManager.h"
 #import "ClipboardManager.h"
+#import "H264Streamer.h"
 #import "Control.h"
 #import "FBSOrientationObserver.h"
 #import "IOKitSPI.h"
@@ -79,6 +80,8 @@ static double gScale = 1.0; // 0 < scale <= 1.0, 1.0 = no scaling
 static int gFpsMin = 0;
 static int gFpsPref = 0;
 static int gFpsMax = 0;
+static int gH264Port = 0;          // 0 = disabled; TCP port for the hardware H.264 stream
+static int gH264BitrateKbps = 500; // target bitrate for the H.264 stream
 static double gDeferWindowSec = 0.015;      // Coalescing window; 0 disables deferral
 static int gMaxInflightUpdates = 2;         // Max concurrent client encodes; drop frames if >= this
 static int gTileSize = 32;                  // Tile size for dirty detection (pixels)
@@ -1117,7 +1120,7 @@ static void parseCLI(int argc, const char *argv[]) {
 #pragma clang diagnostic pop
 
     int opt;
-    const char *optstr = "p:b:n:vA:c:C:s:F:d:Q:t:P:R:aW:w:NM:KU:O:o:I:i:H:D:e:k:B:T:Vh";
+    const char *optstr = "p:b:n:vA:c:C:s:F:d:Q:t:P:R:aW:w:NM:KU:O:o:I:i:H:D:e:k:B:T:VhX:Y:";
     optind = 1;
     while ((opt = getopt(__argc2, __argv2.data(), optstr)) != -1) {
         switch (opt) {
@@ -1523,6 +1526,28 @@ static void parseCLI(int argc, const char *argv[]) {
         case 'V': {
             tvncVerboseLoggingEnabled = YES;
             TVLog(@"CLI: Verbose logging enabled (-V)");
+            break;
+        }
+        case 'X': {
+            int v = atoi(optarg);
+            if (v > 0 && v < 65536) {
+                gH264Port = v;
+                TVLog(@"CLI: H.264 stream enabled on TCP port %d", gH264Port);
+            } else {
+                TVPrintError("Invalid -X value: %s (expected 1..65535)", optarg);
+                exit(EXIT_FAILURE);
+            }
+            break;
+        }
+        case 'Y': {
+            int v = atoi(optarg);
+            if (v >= 50 && v <= 20000) {
+                gH264BitrateKbps = v;
+                TVLog(@"CLI: H.264 bitrate set to %d kbps", gH264BitrateKbps);
+            } else {
+                TVPrintError("Invalid -Y value: %s (expected 50..20000)", optarg);
+                exit(EXIT_FAILURE);
+            }
             break;
         }
         case 'h':
@@ -2261,6 +2286,12 @@ static void handleFramebuffer(CMSampleBufferRef sampleBuffer) {
     if (!pb) {
         TVLogVerbose(@"sampleBuffer has no image buffer (skip)");
         return;
+    }
+
+    // Feed the hardware H.264 streamer (video-only path for low-bandwidth links).
+    // Runs before the VNC busy-drop so the encoder gets every frame it can.
+    if (gH264Port > 0) {
+        [[H264Streamer sharedStreamer] encodeSampleBuffer:sampleBuffer];
     }
 
     // Busy-drop: if encoders are busy and limit reached, skip this frame (disabled when -Q 0)
@@ -5137,6 +5168,14 @@ int main(int argc, const char *argv[]) {
         prepareBulletinManager();
         prepareClipboardManager();
         prepareScreenCapturer();
+
+        if (gH264Port > 0) {
+            int prefFps = gFpsPref > 0 ? gFpsPref : (gFpsMax > 0 ? gFpsMax : 30);
+            [[H264Streamer sharedStreamer] startOnPort:gH264Port
+                                                 scale:gScale
+                                                   fps:prefFps
+                                            bitrateKbps:gH264BitrateKbps];
+        }
 
         initializeTilingOrReset();
         initializeAndRunRfbServer();
