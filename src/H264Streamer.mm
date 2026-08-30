@@ -46,13 +46,14 @@ static void H264_OutputCallback(void *outputCallbackRefCon, void *sourceFrameRef
     int64_t _frameIndex;
 
     std::vector<int> *_clients;
+    std::vector<bool> *_synced; // per-client: has it received its first IDR yet?
     pthread_mutex_t _clientsMutex;
     volatile BOOL _forceKeyframe;
 }
 - (instancetype)initPrivate;
 - (void)acceptLoop;
 - (void)ensureSessionForWidth:(size_t)nativeW height:(size_t)nativeH;
-- (void)broadcast:(NSData *)data;
+- (void)broadcast:(NSData *)data keyframe:(bool)isKeyframe;
 - (void)handleEncoded:(CMSampleBufferRef)sampleBuffer;
 @end
 
@@ -80,6 +81,7 @@ static void *acceptTrampoline(void *ctx) {
         _session = NULL;
         _pool = NULL;
         _clients = new std::vector<int>();
+        _synced = new std::vector<bool>();
         pthread_mutex_init(&_clientsMutex, NULL);
     }
     return self;
@@ -147,6 +149,7 @@ static void *acceptTrampoline(void *ctx) {
         setsockopt(cfd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one)); // don't let a dead client SIGPIPE the daemon
         pthread_mutex_lock(&_clientsMutex);
         _clients->push_back(cfd);
+        _synced->push_back(false);
         pthread_mutex_unlock(&_clientsMutex);
         _forceKeyframe = YES; // next frame becomes an IDR so the new client can decode immediately
         char ip[INET_ADDRSTRLEN] = {0};
@@ -262,11 +265,17 @@ static void writeAll(int fd, const uint8_t *buf, size_t len, bool *ok) {
     }
 }
 
-- (void)broadcast:(NSData *)data {
+- (void)broadcast:(NSData *)data keyframe:(bool)isKeyframe {
     const uint8_t *bytes = (const uint8_t *)data.bytes;
     size_t len = data.length;
     pthread_mutex_lock(&_clientsMutex);
     for (size_t i = 0; i < _clients->size();) {
+        // A client must start its stream on an IDR (with SPS/PPS); skip P-frames until then,
+        // otherwise a live player (ffplay) chokes on "non-existing PPS" at connect time.
+        if (!(*_synced)[i] && !isKeyframe) {
+            i++;
+            continue;
+        }
         int fd = (*_clients)[i];
         bool ok = true;
         writeAll(fd, bytes, len, &ok);
@@ -274,7 +283,10 @@ static void writeAll(int fd, const uint8_t *buf, size_t len, bool *ok) {
             HLog("client fd=%d dropped", fd);
             close(fd);
             _clients->erase(_clients->begin() + i);
+            _synced->erase(_synced->begin() + i);
         } else {
+            if (isKeyframe)
+                (*_synced)[i] = true;
             i++;
         }
     }
@@ -331,7 +343,7 @@ static void writeAll(int fd, const uint8_t *buf, size_t len, bool *ok) {
     }
 
     if (out.length)
-        [self broadcast:out];
+        [self broadcast:out keyframe:keyframe];
 }
 
 - (void)stop {
@@ -346,6 +358,7 @@ static void writeAll(int fd, const uint8_t *buf, size_t len, bool *ok) {
     for (int fd : *_clients)
         close(fd);
     _clients->clear();
+    _synced->clear();
     pthread_mutex_unlock(&_clientsMutex);
     if (_session) {
         VTCompressionSessionCompleteFrames(_session, kCMTimeInvalid);
