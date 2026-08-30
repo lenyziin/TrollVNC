@@ -11,6 +11,7 @@
 
 #import <Accelerate/Accelerate.h>
 #import <CoreVideo/CoreVideo.h>
+#import <QuartzCore/QuartzCore.h>
 #import <VideoToolbox/VideoToolbox.h>
 
 #import <arpa/inet.h>
@@ -19,6 +20,7 @@
 #import <netinet/tcp.h>
 #import <pthread.h>
 #import <sys/socket.h>
+#import <sys/time.h>
 #import <unistd.h>
 
 #import <vector>
@@ -49,10 +51,20 @@ static void H264_OutputCallback(void *outputCallbackRefCon, void *sourceFrameRef
     std::vector<bool> *_synced; // per-client: has it received its first IDR yet?
     pthread_mutex_t _clientsMutex;
     volatile BOOL _forceKeyframe;
+
+    // Steady-framerate idle repeat: keeps a live player's clock stable (raw H.264 has no timestamps).
+    CVPixelBufferRef _lastBuf;
+    double _lastEncTime;
+    dispatch_queue_t _idleQueue;
+    dispatch_source_t _idleTimer;
+    pthread_mutex_t _encMutex;
+    BOOL _idleStarted;
 }
 - (instancetype)initPrivate;
 - (void)acceptLoop;
 - (void)ensureSessionForWidth:(size_t)nativeW height:(size_t)nativeH;
+- (void)doEncodeBuffer:(CVPixelBufferRef)buf force:(BOOL)force;
+- (void)idleTick;
 - (void)broadcast:(NSData *)data keyframe:(bool)isKeyframe;
 - (void)handleEncoded:(CMSampleBufferRef)sampleBuffer;
 @end
@@ -83,6 +95,7 @@ static void *acceptTrampoline(void *ctx) {
         _clients = new std::vector<int>();
         _synced = new std::vector<bool>();
         pthread_mutex_init(&_clientsMutex, NULL);
+        pthread_mutex_init(&_encMutex, NULL);
     }
     return self;
 }
@@ -147,6 +160,8 @@ static void *acceptTrampoline(void *ctx) {
         int one = 1;
         setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
         setsockopt(cfd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one)); // don't let a dead client SIGPIPE the daemon
+        struct timeval sndto = {2, 0}; // 2s send timeout: drop a stuck client instead of freezing the broadcast
+        setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &sndto, sizeof(sndto));
         pthread_mutex_lock(&_clientsMutex);
         _clients->push_back(cfd);
         _synced->push_back(false);
@@ -201,7 +216,71 @@ static void *acceptTrampoline(void *ctx) {
     VTSessionSetProperty(_session, kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, (__bridge CFNumberRef) @(2));
     VTSessionSetProperty(_session, kVTCompressionPropertyKey_ExpectedFrameRate, (__bridge CFNumberRef) @(_fps));
     VTCompressionSessionPrepareToEncodeFrames(_session);
-    HLog("VT session ready: encode %dx%d", w, h);
+
+    if (!_idleStarted) {
+        _idleStarted = YES;
+        _idleQueue = dispatch_queue_create("com.trollvnc.h264.idle", DISPATCH_QUEUE_SERIAL);
+        _idleTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _idleQueue);
+        uint64_t interval = (uint64_t)((1.0 / (double)_fps) * NSEC_PER_SEC);
+        dispatch_source_set_timer(_idleTimer, dispatch_time(DISPATCH_TIME_NOW, (int64_t)interval), interval,
+                                  interval / 4);
+        __unsafe_unretained H264Streamer *weak = self;
+        dispatch_source_set_event_handler(_idleTimer, ^{
+            [weak idleTick];
+        });
+        dispatch_resume(_idleTimer);
+    }
+    HLog("VT session ready: encode %dx%d (steady %d fps)", w, h, _fps);
+}
+
+- (void)doEncodeBuffer:(CVPixelBufferRef)buf force:(BOOL)force {
+    pthread_mutex_lock(&_encMutex);
+    if (!_session) {
+        pthread_mutex_unlock(&_encMutex);
+        return;
+    }
+    CMTime pts = CMTimeMake(_frameIndex++, _fps);
+    CFDictionaryRef frameProps = NULL;
+    if (force) {
+        const void *keys[] = {(const void *)kVTEncodeFrameOptionKey_ForceKeyFrame};
+        const void *vals[] = {(const void *)kCFBooleanTrue};
+        frameProps = CFDictionaryCreate(kCFAllocatorDefault, keys, vals, 1, &kCFTypeDictionaryKeyCallBacks,
+                                        &kCFTypeDictionaryValueCallBacks);
+    }
+    VTCompressionSessionEncodeFrame(_session, buf, pts, kCMTimeInvalid, frameProps, NULL, NULL);
+    if (frameProps)
+        CFRelease(frameProps);
+    _lastEncTime = CACurrentMediaTime();
+    if (buf != _lastBuf) {
+        CVPixelBufferRetain(buf);
+        if (_lastBuf)
+            CVPixelBufferRelease(_lastBuf);
+        _lastBuf = buf;
+    }
+    pthread_mutex_unlock(&_encMutex);
+}
+
+// Re-encode the last frame when the capturer goes quiet (static screen), so the
+// stream keeps a steady framerate. Without this, live players lose their clock.
+- (void)idleTick {
+    if (!_running || !_session)
+        return;
+    pthread_mutex_lock(&_clientsMutex);
+    bool has = !_clients->empty();
+    pthread_mutex_unlock(&_clientsMutex);
+    if (!has)
+        return;
+    pthread_mutex_lock(&_encMutex);
+    CVPixelBufferRef buf = _lastBuf;
+    double age = buf ? (CACurrentMediaTime() - _lastEncTime) : 0.0;
+    if (buf)
+        CVPixelBufferRetain(buf);
+    pthread_mutex_unlock(&_encMutex);
+    if (buf && age > (0.8 / (double)_fps)) {
+        [self doEncodeBuffer:buf force:NO];
+    }
+    if (buf)
+        CVPixelBufferRelease(buf);
 }
 
 - (void)encodeSampleBuffer:(CMSampleBufferRef)sampleBuffer {
@@ -238,18 +317,9 @@ static void *acceptTrampoline(void *ctx) {
     CVPixelBufferUnlockBaseAddress(dst, 0);
     CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
 
-    CMTime pts = CMTimeMake(_frameIndex++, _fps);
-    CFDictionaryRef frameProps = NULL;
-    if (_forceKeyframe) {
-        _forceKeyframe = NO;
-        const void *keys[] = {(const void *)kVTEncodeFrameOptionKey_ForceKeyFrame};
-        const void *vals[] = {(const void *)kCFBooleanTrue};
-        frameProps = CFDictionaryCreate(kCFAllocatorDefault, keys, vals, 1, &kCFTypeDictionaryKeyCallBacks,
-                                        &kCFTypeDictionaryValueCallBacks);
-    }
-    VTCompressionSessionEncodeFrame(_session, dst, pts, kCMTimeInvalid, frameProps, NULL, NULL);
-    if (frameProps)
-        CFRelease(frameProps);
+    BOOL force = _forceKeyframe;
+    _forceKeyframe = NO;
+    [self doEncodeBuffer:dst force:force];
     CVPixelBufferRelease(dst);
 }
 
@@ -366,6 +436,16 @@ static void writeAll(int fd, const uint8_t *buf, size_t len, bool *ok) {
         CFRelease(_session);
         _session = NULL;
     }
+    if (_idleTimer) {
+        dispatch_source_cancel(_idleTimer);
+        _idleTimer = NULL;
+    }
+    pthread_mutex_lock(&_encMutex);
+    if (_lastBuf) {
+        CVPixelBufferRelease(_lastBuf);
+        _lastBuf = NULL;
+    }
+    pthread_mutex_unlock(&_encMutex);
     if (_pool) {
         CVPixelBufferPoolRelease(_pool);
         _pool = NULL;
