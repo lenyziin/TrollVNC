@@ -32,6 +32,7 @@ static const uint8_t kAnnexBStart[4] = {0x00, 0x00, 0x00, 0x01};
 
 static void H264_OutputCallback(void *outputCallbackRefCon, void *sourceFrameRefCon, OSStatus status,
                                 VTEncodeInfoFlags infoFlags, CMSampleBufferRef sampleBuffer);
+static void writeAll(int fd, const uint8_t *buf, size_t len, bool *ok);
 
 @interface H264Streamer () {
     int _listenFd;
@@ -55,6 +56,7 @@ static void H264_OutputCallback(void *outputCallbackRefCon, void *sourceFrameRef
 
     // Steady-framerate idle repeat: keeps a live player's clock stable (raw H.264 has no timestamps).
     CVPixelBufferRef _lastBuf;
+    NSData *_lastKeyframe; // SPS+PPS+IDR of the most recent keyframe, replayed to new clients
     double _lastEncTime;
     dispatch_queue_t _idleQueue;
     dispatch_source_t _idleTimer;
@@ -163,9 +165,17 @@ static void *acceptTrampoline(void *ctx) {
         setsockopt(cfd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one)); // don't let a dead client SIGPIPE the daemon
         struct timeval sndto = {2, 0}; // 2s send timeout: drop a stuck client instead of freezing the broadcast
         setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &sndto, sizeof(sndto));
+        // Replay the last keyframe immediately so this client can decode from its very first
+        // packet, whenever it happened to connect.
         pthread_mutex_lock(&_clientsMutex);
+        bool primed = false;
+        if (_lastKeyframe && _lastKeyframe.length) {
+            bool ok = true;
+            writeAll(cfd, (const uint8_t *)_lastKeyframe.bytes, _lastKeyframe.length, &ok);
+            primed = ok;
+        }
         _clients->push_back(cfd);
-        _synced->push_back(false);
+        _synced->push_back(primed);
         pthread_mutex_unlock(&_clientsMutex);
         _forceKeyframe = YES; // next frame becomes an IDR so the new client can decode immediately
         // Cold start: on a static screen the capturer delivers nothing, so we'd never encode
@@ -458,8 +468,14 @@ static void writeAll(int fd, const uint8_t *buf, size_t len, bool *ok) {
         HLog("encoded #%d: %zu bytes, keyframe=%d (idr=%d p=%d)", sEnc, (size_t)out.length, (int)keyframe, (int)sawIDR,
              (int)sawNonIDR);
 
-    if (out.length)
+    if (out.length) {
+        if (keyframe) {
+            pthread_mutex_lock(&_clientsMutex);
+            _lastKeyframe = [out copy];
+            pthread_mutex_unlock(&_clientsMutex);
+        }
         [self broadcast:out keyframe:keyframe];
+    }
 }
 
 - (void)stop {
