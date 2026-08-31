@@ -56,8 +56,12 @@ static void writeAll(int fd, const uint8_t *buf, size_t len, bool *ok);
 
     // Steady-framerate idle repeat: keeps a live player's clock stable (raw H.264 has no timestamps).
     CVPixelBufferRef _lastBuf;
-    NSData *_lastKeyframe; // SPS+PPS+IDR of the most recent keyframe, replayed to new clients
+    NSData *_lastKeyframe; // last keyframe as TS (PAT+PMT+IDR), replayed to new clients
     double _lastEncTime;
+
+    // MPEG-TS muxer state
+    uint8_t _ccPat, _ccPmt, _ccVid;
+    int64_t _pts90;
     dispatch_queue_t _idleQueue;
     dispatch_source_t _idleTimer;
     pthread_mutex_t _encMutex;
@@ -78,6 +82,160 @@ static void *acceptTrampoline(void *ctx) {
     }
     return NULL;
 }
+
+// ---- Minimal MPEG-TS muxer -------------------------------------------------
+// Wraps the H.264 Annex B access units in an MPEG-TS stream so any player reads
+// it instantly with correct timestamps (raw Annex B forces huge buffering).
+#define TS_PID_PAT 0x0000
+#define TS_PID_PMT 0x1000
+#define TS_PID_VID 0x0100
+
+static uint32_t tsCRC32(const uint8_t *d, size_t n) {
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < n; i++) {
+        crc ^= (uint32_t)d[i] << 24;
+        for (int b = 0; b < 8; b++)
+            crc = (crc & 0x80000000u) ? (crc << 1) ^ 0x04C11DB7u : (crc << 1);
+    }
+    return crc;
+}
+
+static void tsBuildPAT(uint8_t *pkt, uint8_t cc) {
+    memset(pkt, 0xFF, 188);
+    pkt[0] = 0x47;
+    pkt[1] = 0x40 | ((TS_PID_PAT >> 8) & 0x1F);
+    pkt[2] = TS_PID_PAT & 0xFF;
+    pkt[3] = 0x10 | (cc & 0x0F);
+    pkt[4] = 0x00; // pointer field
+    uint8_t *sec = pkt + 5;
+    int s = 0;
+    sec[s++] = 0x00;                                  // table_id (PAT)
+    sec[s++] = 0xB0;                                  // syntax=1, section_length hi
+    sec[s++] = 0x0D;                                  // section_length = 13
+    sec[s++] = 0x00; sec[s++] = 0x01;                 // transport_stream_id
+    sec[s++] = 0xC1;                                  // version 0, current_next 1
+    sec[s++] = 0x00;                                  // section_number
+    sec[s++] = 0x00;                                  // last_section_number
+    sec[s++] = 0x00; sec[s++] = 0x01;                 // program_number 1
+    sec[s++] = 0xE0 | ((TS_PID_PMT >> 8) & 0x1F);     // PMT PID hi
+    sec[s++] = TS_PID_PMT & 0xFF;                      // PMT PID lo
+    uint32_t crc = tsCRC32(sec, s);
+    sec[s++] = (crc >> 24) & 0xFF;
+    sec[s++] = (crc >> 16) & 0xFF;
+    sec[s++] = (crc >> 8) & 0xFF;
+    sec[s++] = crc & 0xFF;
+}
+
+static void tsBuildPMT(uint8_t *pkt, uint8_t cc) {
+    memset(pkt, 0xFF, 188);
+    pkt[0] = 0x47;
+    pkt[1] = 0x40 | ((TS_PID_PMT >> 8) & 0x1F);
+    pkt[2] = TS_PID_PMT & 0xFF;
+    pkt[3] = 0x10 | (cc & 0x0F);
+    pkt[4] = 0x00; // pointer field
+    uint8_t *sec = pkt + 5;
+    int s = 0;
+    sec[s++] = 0x02;                                  // table_id (PMT)
+    sec[s++] = 0xB0;                                  // syntax; length hi patched below
+    sec[s++] = 0x00;                                  // length lo patched below
+    sec[s++] = 0x00; sec[s++] = 0x01;                 // program_number 1
+    sec[s++] = 0xC1;                                  // version 0, current_next 1
+    sec[s++] = 0x00;                                  // section_number
+    sec[s++] = 0x00;                                  // last_section_number
+    sec[s++] = 0xE0 | ((TS_PID_VID >> 8) & 0x1F);     // PCR PID hi
+    sec[s++] = TS_PID_VID & 0xFF;                      // PCR PID lo
+    sec[s++] = 0xF0;                                  // program_info_length hi
+    sec[s++] = 0x00;                                  // program_info_length lo
+    sec[s++] = 0x1B;                                  // stream_type H.264
+    sec[s++] = 0xE0 | ((TS_PID_VID >> 8) & 0x1F);     // elementary PID hi
+    sec[s++] = TS_PID_VID & 0xFF;                      // elementary PID lo
+    sec[s++] = 0xF0;                                  // ES_info_length hi
+    sec[s++] = 0x00;                                  // ES_info_length lo
+    int section_length = (s - 3) + 4;                 // bytes after length field + CRC
+    sec[1] = 0xB0 | ((section_length >> 8) & 0x0F);
+    sec[2] = section_length & 0xFF;
+    uint32_t crc = tsCRC32(sec, s);
+    sec[s++] = (crc >> 24) & 0xFF;
+    sec[s++] = (crc >> 16) & 0xFF;
+    sec[s++] = (crc >> 8) & 0xFF;
+    sec[s++] = crc & 0xFF;
+}
+
+// Wrap one access unit (Annex B) as PES, split into 188-byte TS packets.
+static void tsAppendPES(NSMutableData *out, const uint8_t *au, size_t auLen, int64_t pts, bool keyframe,
+                        uint8_t *vidCC) {
+    static const uint8_t kAUD[6] = {0x00, 0x00, 0x00, 0x01, 0x09, 0xF0};
+    size_t pesLen = 14 + sizeof(kAUD) + auLen;
+    uint8_t *pes = (uint8_t *)malloc(pesLen);
+    if (!pes)
+        return;
+    int h = 0;
+    pes[h++] = 0x00; pes[h++] = 0x00; pes[h++] = 0x01; pes[h++] = 0xE0;
+    pes[h++] = 0x00; pes[h++] = 0x00;                 // PES length: 0 = unbounded (video)
+    pes[h++] = 0x84;                                  // '10', data_alignment
+    pes[h++] = 0x80;                                  // PTS only
+    pes[h++] = 0x05;                                  // PES header data length
+    pes[h++] = (uint8_t)(0x21 | ((pts >> 29) & 0x0E));
+    pes[h++] = (uint8_t)((pts >> 22) & 0xFF);
+    pes[h++] = (uint8_t)(0x01 | ((pts >> 14) & 0xFE));
+    pes[h++] = (uint8_t)((pts >> 7) & 0xFF);
+    pes[h++] = (uint8_t)(0x01 | ((pts << 1) & 0xFE));
+    memcpy(pes + h, kAUD, sizeof(kAUD)); h += sizeof(kAUD);
+    memcpy(pes + h, au, auLen);
+
+    size_t pos = 0;
+    bool firstPkt = true;
+    while (pos < pesLen) {
+        size_t remaining = pesLen - pos;
+        bool wantPCR = (firstPkt && keyframe);
+        size_t payloadLen;
+        bool af;
+        if (wantPCR) {
+            payloadLen = remaining < 176 ? remaining : 176;
+            af = true;
+        } else if (remaining < 184) {
+            payloadLen = remaining;
+            af = true;
+        } else {
+            payloadLen = 184;
+            af = false;
+        }
+        uint8_t pkt[188];
+        pkt[0] = 0x47;
+        pkt[1] = (uint8_t)((firstPkt ? 0x40 : 0x00) | ((TS_PID_VID >> 8) & 0x1F));
+        pkt[2] = (uint8_t)(TS_PID_VID & 0xFF);
+        uint8_t afc = af ? (payloadLen > 0 ? 0x30 : 0x20) : 0x10;
+        pkt[3] = (uint8_t)(afc | (*vidCC & 0x0F));
+        *vidCC = (*vidCC + 1) & 0x0F;
+        int idx = 4;
+        if (af) {
+            int afLen = 183 - (int)payloadLen;
+            pkt[idx++] = (uint8_t)afLen;
+            if (afLen > 0) {
+                pkt[idx++] = wantPCR ? 0x10 : 0x00; // adaptation flags
+                int already = 1;
+                if (wantPCR) {
+                    int64_t base = pts & 0x1FFFFFFFFLL; // PCR base = PTS (ext 0)
+                    pkt[idx++] = (uint8_t)((base >> 25) & 0xFF);
+                    pkt[idx++] = (uint8_t)((base >> 17) & 0xFF);
+                    pkt[idx++] = (uint8_t)((base >> 9) & 0xFF);
+                    pkt[idx++] = (uint8_t)((base >> 1) & 0xFF);
+                    pkt[idx++] = (uint8_t)(((base & 1) << 7) | 0x7E);
+                    pkt[idx++] = 0x00;
+                    already += 6;
+                }
+                for (int k = 0; k < afLen - already; k++)
+                    pkt[idx++] = 0xFF;
+            }
+        }
+        memcpy(pkt + idx, pes + pos, payloadLen);
+        [out appendBytes:pkt length:188];
+        pos += payloadLen;
+        firstPkt = false;
+    }
+    free(pes);
+}
+// ---------------------------------------------------------------------------
 
 @implementation H264Streamer
 
@@ -493,18 +651,35 @@ static void writeAll(int fd, const uint8_t *buf, size_t len, bool *ok) {
     }
     [out appendData:slices];
 
+    if (!out.length)
+        return;
+
+    // Mux the access unit into MPEG-TS (PAT/PMT before each keyframe).
+    _pts90 += 90000 / (_fps > 0 ? _fps : 20);
+    NSMutableData *ts = [NSMutableData dataWithCapacity:out.length + 1024];
+    if (keyframe) {
+        uint8_t pat[188], pmt[188];
+        tsBuildPAT(pat, _ccPat);
+        _ccPat = (_ccPat + 1) & 0x0F;
+        tsBuildPMT(pmt, _ccPmt);
+        _ccPmt = (_ccPmt + 1) & 0x0F;
+        [ts appendBytes:pat length:188];
+        [ts appendBytes:pmt length:188];
+    }
+    tsAppendPES(ts, (const uint8_t *)out.bytes, out.length, _pts90, keyframe, &_ccVid);
+
     static int sEnc = 0;
     if (++sEnc <= 10 || sEnc % 50 == 0)
-        HLog("encoded #%d: %zu bytes, keyframe=%d (idr=%d p=%d)", sEnc, (size_t)out.length, (int)keyframe, (int)sawIDR,
-             (int)sawNonIDR);
+        HLog("encoded #%d: %zu bytes AU -> %zu TS, keyframe=%d (idr=%d p=%d)", sEnc, (size_t)out.length,
+             (size_t)ts.length, (int)keyframe, (int)sawIDR, (int)sawNonIDR);
 
-    if (out.length) {
+    if (ts.length) {
         if (keyframe) {
             pthread_mutex_lock(&_clientsMutex);
-            _lastKeyframe = [out copy];
+            _lastKeyframe = [ts copy];
             pthread_mutex_unlock(&_clientsMutex);
         }
-        [self broadcast:out keyframe:keyframe];
+        [self broadcast:ts keyframe:keyframe];
     }
 }
 
