@@ -362,6 +362,7 @@ static void writeAll(int fd, const uint8_t *buf, size_t len, bool *ok) {
         // A client must start its stream on an IDR (with SPS/PPS); skip P-frames until then,
         // otherwise a live player (ffplay) chokes on "non-existing PPS" at connect time.
         if (!(*_synced)[i] && !isKeyframe) {
+            _forceKeyframe = YES; // someone is still waiting: make the next frame an IDR
             static int sSkip = 0;
             if (++sSkip % 25 == 1)
                 HLog("client not synced yet, waiting for keyframe (skipped %d)", sSkip);
@@ -389,15 +390,52 @@ static void writeAll(int fd, const uint8_t *buf, size_t len, bool *ok) {
     if (!sb || !CMSampleBufferDataIsReady(sb))
         return;
 
-    bool keyframe = false;
+    // Default to "sync sample": VideoToolbox often attaches nothing for keyframes.
+    bool keyframe = true;
     CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(sb, false);
     if (attachments && CFArrayGetCount(attachments) > 0) {
         CFDictionaryRef d = (CFDictionaryRef)CFArrayGetValueAtIndex(attachments, 0);
-        keyframe = !CFDictionaryContainsKey(d, kCMSampleAttachmentKey_NotSync);
+        if (CFDictionaryContainsKey(d, kCMSampleAttachmentKey_NotSync)) {
+            CFBooleanRef notSync = (CFBooleanRef)CFDictionaryGetValue(d, kCMSampleAttachmentKey_NotSync);
+            keyframe = (notSync && !CFBooleanGetValue(notSync));
+        }
     }
 
-    NSMutableData *out = [NSMutableData data];
+    // Pass 1: convert AVCC -> Annex B and inspect NAL types. Type 5 (IDR) is the
+    // authoritative keyframe signal; type 1 means a plain P-slice.
+    NSMutableData *slices = [NSMutableData data];
+    bool sawIDR = false, sawNonIDR = false;
+    CMBlockBufferRef bb = CMSampleBufferGetDataBuffer(sb);
+    if (bb) {
+        size_t totalLen = 0;
+        char *dataPtr = NULL;
+        if (CMBlockBufferGetDataPointer(bb, 0, NULL, &totalLen, &dataPtr) == noErr && dataPtr) {
+            size_t offset = 0;
+            while (offset + 4 <= totalLen) {
+                uint32_t nalLen = 0;
+                memcpy(&nalLen, dataPtr + offset, 4);
+                nalLen = CFSwapInt32BigToHost(nalLen);
+                offset += 4;
+                if (nalLen == 0 || offset + nalLen > totalLen)
+                    break;
+                uint8_t nalType = (uint8_t)(dataPtr[offset] & 0x1F);
+                if (nalType == 5)
+                    sawIDR = true;
+                else if (nalType == 1)
+                    sawNonIDR = true;
+                [slices appendBytes:kAnnexBStart length:4];
+                [slices appendBytes:(dataPtr + offset) length:nalLen];
+                offset += nalLen;
+            }
+        }
+    }
+    if (sawIDR)
+        keyframe = true;
+    else if (sawNonIDR)
+        keyframe = false;
 
+    // Pass 2: on a keyframe, lead with SPS/PPS so any player can start decoding here.
+    NSMutableData *out = [NSMutableData data];
     if (keyframe) {
         CMFormatDescriptionRef fmt = CMSampleBufferGetFormatDescription(sb);
         if (fmt) {
@@ -413,30 +451,12 @@ static void writeAll(int fd, const uint8_t *buf, size_t len, bool *ok) {
             }
         }
     }
-
-    CMBlockBufferRef bb = CMSampleBufferGetDataBuffer(sb);
-    if (bb) {
-        size_t totalLen = 0;
-        char *dataPtr = NULL;
-        if (CMBlockBufferGetDataPointer(bb, 0, NULL, &totalLen, &dataPtr) == noErr && dataPtr) {
-            size_t offset = 0;
-            while (offset + 4 <= totalLen) {
-                uint32_t nalLen = 0;
-                memcpy(&nalLen, dataPtr + offset, 4);
-                nalLen = CFSwapInt32BigToHost(nalLen);
-                offset += 4;
-                if (nalLen == 0 || offset + nalLen > totalLen)
-                    break;
-                [out appendBytes:kAnnexBStart length:4];
-                [out appendBytes:(dataPtr + offset) length:nalLen];
-                offset += nalLen;
-            }
-        }
-    }
+    [out appendData:slices];
 
     static int sEnc = 0;
     if (++sEnc <= 10 || sEnc % 50 == 0)
-        HLog("encoded #%d: %zu bytes, keyframe=%d", sEnc, (size_t)out.length, (int)keyframe);
+        HLog("encoded #%d: %zu bytes, keyframe=%d (idr=%d p=%d)", sEnc, (size_t)out.length, (int)keyframe, (int)sawIDR,
+             (int)sawNonIDR);
 
     if (out.length)
         [self broadcast:out keyframe:keyframe];
