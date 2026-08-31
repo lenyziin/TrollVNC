@@ -286,11 +286,13 @@ static void *acceptTrampoline(void *ctx) {
     pthread_mutex_unlock(&_clientsMutex);
     if (!has)
         return;
-    // Drive the capturer ourselves: its dirty-detection stops delivering frames on a static
-    // screen, which would stall the stream. While someone is watching, ask for every frame.
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [[ScreenCapturer sharedCapturer] forceNextFrameUpdate];
-    });
+    // Nudge the capturer, but rate-limited: flooding the main queue starves capture itself.
+    static int sNudge = 0;
+    if (++sNudge % 6 == 0) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[ScreenCapturer sharedCapturer] forceNextFrameUpdate];
+        });
+    }
 
     pthread_mutex_lock(&_encMutex);
     CVPixelBufferRef buf = _lastBuf;
