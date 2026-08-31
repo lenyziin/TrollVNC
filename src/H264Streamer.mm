@@ -276,7 +276,9 @@ static void *acceptTrampoline(void *ctx) {
     if (buf)
         CVPixelBufferRetain(buf);
     pthread_mutex_unlock(&_encMutex);
-    if (buf && age > (0.8 / (double)_fps)) {
+    // When the screen is static, re-encode at only ~3 fps (not the full rate): keeps the
+    // stream warm for the player while drastically cutting encoder/CPU heat.
+    if (buf && age > 0.30) {
         [self doEncodeBuffer:buf force:NO];
     }
     if (buf)
