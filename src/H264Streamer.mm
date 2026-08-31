@@ -318,6 +318,10 @@ static void *acceptTrampoline(void *ctx) {
     if (!hasClients)
         return;
 
+    static int sFeed = 0;
+    if (++sFeed <= 5 || sFeed % 100 == 0)
+        HLog("capture frame #%d fed to encoder", sFeed);
+
     CVPixelBufferRef dst = NULL;
     if (CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, _pool, &dst) != kCVReturnSuccess || !dst)
         return;
@@ -358,6 +362,9 @@ static void writeAll(int fd, const uint8_t *buf, size_t len, bool *ok) {
         // A client must start its stream on an IDR (with SPS/PPS); skip P-frames until then,
         // otherwise a live player (ffplay) chokes on "non-existing PPS" at connect time.
         if (!(*_synced)[i] && !isKeyframe) {
+            static int sSkip = 0;
+            if (++sSkip % 25 == 1)
+                HLog("client not synced yet, waiting for keyframe (skipped %d)", sSkip);
             i++;
             continue;
         }
@@ -426,6 +433,10 @@ static void writeAll(int fd, const uint8_t *buf, size_t len, bool *ok) {
             }
         }
     }
+
+    static int sEnc = 0;
+    if (++sEnc <= 10 || sEnc % 50 == 0)
+        HLog("encoded #%d: %zu bytes, keyframe=%d", sEnc, (size_t)out.length, (int)keyframe);
 
     if (out.length)
         [self broadcast:out keyframe:keyframe];
