@@ -8,6 +8,7 @@
 */
 
 #import "H264Streamer.h"
+#import "ScreenCapturer.h"
 
 #import <Accelerate/Accelerate.h>
 #import <CoreVideo/CoreVideo.h>
@@ -167,6 +168,11 @@ static void *acceptTrampoline(void *ctx) {
         _synced->push_back(false);
         pthread_mutex_unlock(&_clientsMutex);
         _forceKeyframe = YES; // next frame becomes an IDR so the new client can decode immediately
+        // Cold start: on a static screen the capturer delivers nothing, so we'd never encode
+        // a first frame and the client would wait forever. Ask for one explicitly.
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[ScreenCapturer sharedCapturer] forceNextFrameUpdate];
+        });
         char ip[INET_ADDRSTRLEN] = {0};
         inet_ntop(AF_INET, &cli.sin_addr, ip, sizeof(ip));
         HLog("client connected from %s (fd=%d)", ip, cfd);
@@ -279,7 +285,14 @@ static void *acceptTrampoline(void *ctx) {
     // When the screen is static, re-encode at only ~3 fps (not the full rate): keeps the
     // stream warm for the player while drastically cutting encoder/CPU heat.
     if (buf && age > 0.30) {
-        [self doEncodeBuffer:buf force:NO];
+        BOOL force = _forceKeyframe;
+        _forceKeyframe = NO;
+        [self doEncodeBuffer:buf force:force];
+    } else if (!buf) {
+        // No frame captured yet (fully static screen): nudge the capturer so we get one.
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[ScreenCapturer sharedCapturer] forceNextFrameUpdate];
+        });
     }
     if (buf)
         CVPixelBufferRelease(buf);
