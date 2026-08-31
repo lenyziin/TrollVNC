@@ -163,7 +163,7 @@ static void *acceptTrampoline(void *ctx) {
         int one = 1;
         setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
         setsockopt(cfd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one)); // don't let a dead client SIGPIPE the daemon
-        struct timeval sndto = {2, 0}; // 2s send timeout: drop a stuck client instead of freezing the broadcast
+        struct timeval sndto = {5, 0}; // generous on a slow cellular uplink; a timeout skips a frame, not the client
         setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &sndto, sizeof(sndto));
         // Replay the last keyframe immediately so this client can decode from its very first
         // packet, whenever it happened to connect.
@@ -360,16 +360,29 @@ static void *acceptTrampoline(void *ctx) {
     CVPixelBufferRelease(dst);
 }
 
-static void writeAll(int fd, const uint8_t *buf, size_t len, bool *ok) {
+// Returns via *ok: false only for a real connection error. A slow-link timeout is reported
+// through *timedOut so the caller can skip the frame instead of dropping the viewer.
+static void writeAllEx(int fd, const uint8_t *buf, size_t len, bool *ok, bool *timedOut) {
     size_t sent = 0;
     while (sent < len) {
         ssize_t n = send(fd, buf + sent, len - sent, 0);
-        if (n <= 0) {
-            *ok = false;
+        if (n > 0) {
+            sent += (size_t)n;
+            continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+            if (timedOut)
+                *timedOut = true; // uplink is saturated: give up on THIS frame only
             return;
         }
-        sent += (size_t)n;
+        *ok = false;
+        return;
     }
+}
+
+static void writeAll(int fd, const uint8_t *buf, size_t len, bool *ok) {
+    bool ignored = false;
+    writeAllEx(fd, buf, len, ok, &ignored);
 }
 
 - (void)broadcast:(NSData *)data keyframe:(bool)isKeyframe {
@@ -388,16 +401,25 @@ static void writeAll(int fd, const uint8_t *buf, size_t len, bool *ok) {
             continue;
         }
         int fd = (*_clients)[i];
-        bool ok = true;
-        writeAll(fd, bytes, len, &ok);
+        bool ok = true, slow = false;
+        writeAllEx(fd, bytes, len, &ok, &slow);
         if (!ok) {
-            HLog("client fd=%d dropped", fd);
+            HLog("client fd=%d dropped (connection error)", fd);
             close(fd);
             _clients->erase(_clients->begin() + i);
             _synced->erase(_synced->begin() + i);
         } else {
-            if (isKeyframe)
+            if (slow) {
+                // Partial write on a saturated uplink: the client's stream is now broken,
+                // so re-sync it with a fresh keyframe instead of killing the connection.
+                (*_synced)[i] = false;
+                _forceKeyframe = YES;
+                static int sSlow = 0;
+                if (++sSlow % 10 == 1)
+                    HLog("uplink saturated, skipped a frame (x%d)", sSlow);
+            } else if (isKeyframe) {
                 (*_synced)[i] = true;
+            }
             i++;
         }
     }
